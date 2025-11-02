@@ -1,0 +1,7 @@
+cat > .gitignore <<EOF
+.venv/
+venv/
+__pycache__/
+.DS_Store
+.env
+EOF
