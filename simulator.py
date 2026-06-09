@@ -10,7 +10,11 @@ class VideoSimulator:
     """
     def __init__(self, trace_df, bitrate_ladder, chunk_duration=2.0, buffer_cap=30.0):
         """
-        trace_df must have columns: ['time_s', 'bandwidth_kbps']
+        Args:
+            trace_df: DataFrame with columns ``time_s`` and ``bandwidth_kbps``.
+            bitrate_ladder: List of available bitrates in kbps, e.g. [300, 600, 900, ...].
+            chunk_duration: Video segment length in seconds (default 2.0).
+            buffer_cap: Maximum playback buffer size in seconds (default 30.0).
         """
         self.trace = trace_df.reset_index(drop=True)
         self.bitrate_ladder = bitrate_ladder
@@ -84,16 +88,16 @@ class VideoSimulator:
         return pd.DataFrame(logs)
 
 
-# handy loader for your txt traces
-def load_trace_txt(path):
+def load_trace_txt(path: str) -> pd.DataFrame:
     """
-    Your txt format looks like:
-    col0: time (or something increasing)
-    col5: bandwidth
-    We'll map it to (time_s, bandwidth_kbps)
+    Load a bandwidth trace file.
+
+    Expects whitespace-separated columns where column 0 is wall-clock time (s)
+    and column 5 is throughput (kbps), matching the NorNet/HSDPA trace format.
+    Time is normalized so the first row starts at 0.
     """
-    df = pd.read_csv(path, sep=r"\s+", header=None)
-    # col 0 => time, col 5 => bandwidth
-    time_s = df.iloc[:, 0].astype(float)
-    bw_kbps = df.iloc[:, 5].astype(float)
-    return pd.DataFrame({"time_s": time_s, "bandwidth_kbps": bw_kbps})
+    df = pd.read_csv(path, sep=r"\s+", header=None, usecols=[0, 5])
+    df.columns = ["time_s", "bandwidth_kbps"]
+    df["time_s"] = df["time_s"].astype(float) - df["time_s"].astype(float).iloc[0]
+    df["bandwidth_kbps"] = df["bandwidth_kbps"].astype(float)
+    return df

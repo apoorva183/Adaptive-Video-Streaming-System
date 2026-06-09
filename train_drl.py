@@ -1,4 +1,10 @@
 # train_drl.py
+"""
+End-to-end PPO training and evaluation for the Adaptive Bitrate streaming project.
+
+Trains a PPO agent on bandwidth traces, then benchmarks it against three
+rule-based baselines (Fixed, Rate-Based, Buffer-Based) on held-out test traces.
+"""
 import os
 import glob
 import shutil
@@ -11,6 +17,8 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 
+from simulator import VideoSimulator, load_trace_txt
+from policies import fixed_policy, rate_based_policy, buffer_based_policy
 from utils_metrics import (
     compute_metrics,
     add_normalized_qoe,
@@ -18,7 +26,6 @@ from utils_metrics import (
     add_viewer_score_simple,
 )
 
-# try to import visualizations (diagram, reward curve)
 try:
     from visualize_training import (
         plot_reward_curve,
@@ -27,139 +34,23 @@ try:
     )
     HAVE_VIZ = True
 except Exception as e:
-    print("⚠️ visualize_training import failed:", e)
+    print("visualize_training import failed:", e)
     HAVE_VIZ = False
 
 
 # ======================================================
-# 1. basic trace loader
-# ======================================================
-def load_trace_txt(path: str) -> pd.DataFrame:
-    """
-    Load one mobility/network trace.
-    We only need: time_s, bandwidth_kbps (col 0 and col 5 in NorNet logs)
-    """
-    df = pd.read_csv(path, sep=r"\s+", header=None, usecols=[0, 5])
-    df.columns = ["time_s", "bandwidth_kbps"]
-    # normalize time to start from 0
-    df["time_s"] = df["time_s"] - df["time_s"].iloc[0]
-    return df
-
-
-# ======================================================
-# 2. simulator (step 1 logic)
-# ======================================================
-class VideoSimulator:
-    """
-    Same as your step-1 simulator:
-    - replays bandwidth over time
-    - downloads chunks
-    - tracks buffer, rebuffer
-    - returns per-chunk log as DataFrame
-    """
-
-    def __init__(self, trace_df, bitrate_ladder, chunk_duration=2.0, buffer_cap=30.0):
-        self.trace = trace_df.reset_index(drop=True)
-        self.bitrate_ladder = bitrate_ladder
-        self.chunk_duration = chunk_duration
-        self.buffer_cap = buffer_cap
-
-    def get_bandwidth(self, t):
-        if t <= self.trace.time_s.iloc[0]:
-            return float(self.trace.bandwidth_kbps.iloc[0])
-        if t >= self.trace.time_s.iloc[-1]:
-            return float(self.trace.bandwidth_kbps.iloc[-1])
-        return float(np.interp(t, self.trace.time_s, self.trace.bandwidth_kbps))
-
-    def run(self, policy_fn, num_chunks=40, player_name="unknown"):
-        logs = []
-        buffer_s = 0.0
-        wall_t = 0.0
-        recent_bw = []
-
-        for chunk_id in range(1, num_chunks + 1):
-            # current network
-            curr_bw = self.get_bandwidth(wall_t)
-            recent_bw.append(curr_bw)
-            if len(recent_bw) > 5:
-                recent_bw.pop(0)
-
-            # policy decides bitrate
-            bitrate = policy_fn(buffer_s, recent_bw)
-
-            # how long to download?
-            chunk_size = bitrate * self.chunk_duration  # kbits
-            download_time = chunk_size / max(curr_bw, 1e-6)
-
-            # drain buffer while downloading
-            if buffer_s > 0:
-                if buffer_s >= download_time:
-                    buffer_s -= download_time
-                    rebuffer = 0.0
-                else:
-                    rebuffer = download_time - buffer_s
-                    buffer_s = 0.0
-            else:
-                rebuffer = download_time
-                buffer_s = 0.0
-
-            # add new chunk
-            buffer_s = min(buffer_s + self.chunk_duration, self.buffer_cap)
-            wall_t += download_time
-
-            logs.append(
-                {
-                    "chunk_id": chunk_id,
-                    "player": player_name,
-                    "bitrate_kbps": bitrate,
-                    "bandwidth_kbps": curr_bw,
-                    "download_time_s": download_time,
-                    "rebuffer_s": rebuffer,
-                    "buffer_after_s": buffer_s,
-                    "wall_time_s": wall_t,
-                }
-            )
-
-        return pd.DataFrame(logs)
-
-
-# ======================================================
-# 3. rule-based players (step 2 logic)
-# ======================================================
-def fixed_policy(bitrate=900):
-    return lambda buffer_s, recent_bw: bitrate
-
-
-def rate_based_policy(bitrate_ladder, safety=0.85):
-    def fn(buffer_s, recent_bw):
-        if not recent_bw:
-            return bitrate_ladder[0]
-        est_bw = float(np.mean(recent_bw)) * safety
-        choices = [b for b in bitrate_ladder if b <= est_bw]
-        return choices[-1] if choices else bitrate_ladder[0]
-
-    return fn
-
-
-def buffer_based_policy(bitrate_ladder, low=5, high=15):
-    def fn(buffer_s, recent_bw):
-        if buffer_s < low:
-            return bitrate_ladder[0]
-        elif buffer_s < high:
-            return bitrate_ladder[len(bitrate_ladder) // 2]
-        else:
-            return bitrate_ladder[-1]
-
-    return fn
-
-
-# ======================================================
-# 4. RL environment (step 3 logic)
+# RL environment used for PPO training
 # ======================================================
 class SimpleABREnv(gym.Env):
     """
-    Gym-style wrapper around the same download/buffer logic.
-    PPO will train on this.
+    Gymnasium environment used for PPO training.
+
+    Differences from ABREnv in abr_env.py:
+    - 3-element observation [buffer_s, est_bw, last_bitrate] instead of 4.
+    - Randomises bandwidth scale (1.0 / 0.7 / 0.5) at every episode reset to
+      expose the agent to varied network conditions during training.
+    - Applies a conservative safety cap when the buffer is very low to reduce
+      catastrophic rebuffer events early in training.
     """
 
     metadata = {"render_modes": []}
@@ -284,9 +175,6 @@ class SimpleABREnv(gym.Env):
         return self._get_obs(), float(reward), done, False, info
 
 
-# ======================================================
-# 5. main train + eval
-# ======================================================
 def main():
     # start fresh
     if os.path.exists("outputs"):
